@@ -35,7 +35,7 @@ pub enum TryRecvError {
     #[error("Disconnected")]
     Disconnected,
     #[error("Other: {0}")]
-    Other(Box<dyn std::error::Error + Send + Sync + 'static>),
+    Other(#[source] anyhow::Error),
 }
 
 #[derive(Debug, Error)]
@@ -43,7 +43,7 @@ pub enum IpcRecvError {
     #[error("Disconnected")]
     Disconnected,
     #[error("Other: {0}")]
-    Other(Box<dyn std::error::Error + Send + Sync + 'static>),
+    Other(#[source] anyhow::Error),
 }
 
 #[derive(Debug, Error)]
@@ -53,7 +53,7 @@ pub enum IpcSendError {
     #[error("Crossbeam")]
     Crossbeam,
     #[error("Other: {0}")]
-    Other(Box<dyn std::error::Error + Send + Sync + 'static>),
+    Other(#[source] anyhow::Error),
 }
 
 #[derive(Debug, Error)]
@@ -63,9 +63,10 @@ pub enum RecvFdError {
     #[error("Disconnected")]
     Disconnected,
     #[error("Other: {0}")]
-    Other(Box<dyn std::error::Error + Send + Sync + 'static>),
+    Other(#[source] anyhow::Error),
 }
 
+#[repr(C)]
 #[derive(Debug, Error)]
 pub enum Error {
     #[error("IO Error {0}")]
@@ -100,6 +101,28 @@ pub enum Error {
     ControlPlane(&'static str, phoenix_api::Error),
 }
 
+impl From<Error> for i32 {
+    fn from(value: Error) -> Self {
+        match value {
+            Error::Io(_) => 1,
+            Error::Bincode(_) => 2,
+            Error::IpcSend(_) => 3,
+            Error::IpcRecv(_) => 4,
+            Error::TryRecv(_) => 5,
+            Error::UnixDomainSocket(_) => 6,
+            Error::SendFd(_) => 7,
+            Error::RecvFd(_) => 8,
+            Error::TryRecvFd(_) => 9,
+            Error::ShmIpc(_) => 10,
+            Error::ShmRingbuf(_) => 11,
+            Error::ShmObj(_) => 12,
+            Error::EmptyCredential => 13,
+            Error::CredentialMismatch(..) => 14,
+            Error::ControlPlane(..) => 15,
+        }
+    }
+}
+
 impl From<crate::ipc_channel::TryRecvError> for TryRecvError {
     fn from(other: crate::ipc_channel::TryRecvError) -> Self {
         use crate::ipc_channel::IpcRecvError as IRE;
@@ -108,8 +131,8 @@ impl From<crate::ipc_channel::TryRecvError> for TryRecvError {
             ITRE::Empty => TryRecvError::Empty,
             ITRE::IpcError(e) => match e {
                 IRE::Disconnected => TryRecvError::Disconnected,
-                IRE::Io(err) => TryRecvError::Other(Box::new(err)),
-                IRE::Bincode(err) => TryRecvError::Other(Box::new(err)),
+                IRE::Io(err) => TryRecvError::Other(err.into()),
+                IRE::Bincode(err) => TryRecvError::Other(err.into()),
             },
         }
     }
@@ -126,8 +149,8 @@ impl From<crate::ipc_channel::IpcRecvError> for IpcRecvError {
         use crate::ipc_channel::IpcRecvError as IRE;
         match other {
             IRE::Disconnected => IpcRecvError::Disconnected,
-            IRE::Io(err) => IpcRecvError::Other(Box::new(err)),
-            IRE::Bincode(err) => IpcRecvError::Other(Box::new(err)),
+            IRE::Io(err) => IpcRecvError::Other(err.into()),
+            IRE::Bincode(err) => IpcRecvError::Other(err.into()),
         }
     }
 }

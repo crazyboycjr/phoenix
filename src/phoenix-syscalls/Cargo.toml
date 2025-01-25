@@ -4,11 +4,9 @@ version = "0.1.0"
 edition = "2021"
 
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
-# [lib]
-# crate-type = ["dylib", "rlib"]
 
 [dependencies]
-phoenix-api = { workspace = true, features = ["transport"] }
+phoenix-api = { workspace = true, features = ["transport", "ibprovider"] }
 ipc.workspace = true
 utils.workspace = true
 
@@ -21,5 +19,7 @@ memmap2.workspace = true
 spin.workspace = true
 lazy_static.workspace = true
 serde_json.workspace = true
+safeverbs = { workspace = true, features = ["serde"] }
 
 [features]
+capi = []

@@ -115,9 +115,11 @@ transport-tcp = { path = "../../src/plugin/transport-tcp", package = "phoenix-tr
 phoenix-salloc = { path = "../../src/plugin/salloc", package = "phoenix-salloc" }
 utils = { path = "../../src/utils" }
 
-phoenix-api = { git = "https://github.com/phoenix-dataplane/phoenix-api", tag = "v0.1.0" }
+# phoenix-api = { git = "https://github.com/phoenix-dataplane/phoenix-api", tag = "v0.1.0" }
+phoenix-api = { path = "../../../phoenix-api" }
 mmap = { git = "https://github.com/phoenix-dataplane/mmap-rs", tag = "v0.1.0" }
-rdma = { git = "https://github.com/phoenix-dataplane/rdma-rs", tag = "v0.1.0" }
+# rdma = { git = "https://github.com/phoenix-dataplane/rdma-rs", tag = "v0.1.0" }
+rdma = { path = "../../../rdma-rs" }
 
 thiserror = "1.0.31"
 uuid = "0.8.2"

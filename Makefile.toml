@@ -22,6 +22,7 @@ dependencies = [
   "build-phoenixos",
   "build-plugins",
   "deploy-plugins",
+  "build-capi",
   "run-phoenixos",
 ]
 
@@ -73,6 +74,11 @@ args = ["${@}"]
 
 [tasks.run]
 alias = "run-phoenixos"
+
+[tasks.build-capi]
+description = "Generate C headers and libraries for phoenix provider in rdma-core"
+cwd = "${PROJECT_ROOT}"
+script = "cargo cinstall --release -p phoenix-syscalls --prefix=${PHOENIX_PREFIX}"
 
 [tasks.build-plugins]
 description = '''

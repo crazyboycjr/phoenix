@@ -56,7 +56,7 @@ use core::ops::Bound::{Excluded, Included, Unbounded};
 use core::ops::{self, Index, IndexMut, Range, RangeBounds};
 use core::ptr;
 use core::slice;
-use core::str::pattern::Pattern;
+use core::str::pattern::{Pattern, Utf8Pattern};
 #[cfg(not(no_global_oom_handling))]
 #[cfg(not(no_global_oom_handling))]
 use std::borrow::Cow; // TODO(cjr): Consider to ShmCow and ShmBorrow in the future?
@@ -1258,10 +1258,7 @@ impl<A: ShmAllocator> String<A> {
     /// assert_eq!("bna", s);
     /// ```
     #[cfg(not(no_global_oom_handling))]
-    pub fn remove_matches<'a, P>(&'a mut self, pat: P)
-    where
-        P: for<'x> Pattern<'x>,
-    {
+    pub fn remove_matches<P: Pattern>(&mut self, pat: P) {
         use core::str::pattern::Searcher;
 
         let rejections = {
@@ -1876,36 +1873,47 @@ impl<'a, A: ShmAllocator> Extend<Cow<'a, str>> for String<A> {
 /// ```
 /// assert_eq!(String::from("Hello world").find("world"), Some(6));
 /// ```
-impl<'a, 'b, A: ShmAllocator> Pattern<'a> for &'b String<A> {
-    type Searcher = <&'b str as Pattern<'a>>::Searcher;
+impl<'b, A: ShmAllocator> Pattern for &'b String<A> {
+    type Searcher<'a> = <&'b str as Pattern>::Searcher<'a>;
 
-    fn into_searcher(self, haystack: &'a str) -> <&'b str as Pattern<'a>>::Searcher {
+    fn into_searcher(self, haystack: &str) -> <&'b str as Pattern>::Searcher<'_> {
         self[..].into_searcher(haystack)
     }
 
     #[inline]
-    fn is_contained_in(self, haystack: &'a str) -> bool {
+    fn is_contained_in(self, haystack: &str) -> bool {
         self[..].is_contained_in(haystack)
     }
 
     #[inline]
-    fn is_prefix_of(self, haystack: &'a str) -> bool {
+    fn is_prefix_of(self, haystack: &str) -> bool {
         self[..].is_prefix_of(haystack)
     }
 
     #[inline]
-    fn strip_prefix_of(self, haystack: &'a str) -> Option<&'a str> {
+    fn strip_prefix_of(self, haystack: &str) -> Option<&str> {
         self[..].strip_prefix_of(haystack)
     }
 
     #[inline]
-    fn is_suffix_of(self, haystack: &'a str) -> bool {
+    fn is_suffix_of<'a>(self, haystack: &'a str) -> bool
+    where
+        Self::Searcher<'a>: core::str::pattern::ReverseSearcher<'a>,
+    {
         self[..].is_suffix_of(haystack)
     }
 
     #[inline]
-    fn strip_suffix_of(self, haystack: &'a str) -> Option<&'a str> {
+    fn strip_suffix_of<'a>(self, haystack: &'a str) -> Option<&'a str>
+    where
+        Self::Searcher<'a>: core::str::pattern::ReverseSearcher<'a>,
+    {
         self[..].strip_suffix_of(haystack)
+    }
+
+    #[inline]
+    fn as_utf8_pattern(&self) -> Option<Utf8Pattern<'_>> {
+        Some(Utf8Pattern::StringPattern(self.as_bytes()))
     }
 }
 

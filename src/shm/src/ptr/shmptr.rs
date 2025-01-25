@@ -232,7 +232,7 @@ impl<T: ?Sized> fmt::Pointer for ShmPtr<T> {
     }
 }
 
-impl<T: ?Sized> const From<ShmNonNull<T>> for ShmPtr<T> {
+impl<T: ?Sized> From<ShmNonNull<T>> for ShmPtr<T> {
     /// Converts a `ShmNonNull<T>` to a `ShmPtr<T>`.
     ///
     /// This conversion is infallible since `ShmNonNull` cannot be null.

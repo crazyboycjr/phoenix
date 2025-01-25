@@ -1804,6 +1804,12 @@ fn rustc_clap_options(app_name: &'static str) -> clap::Command {
                 .action(clap::ArgAction::Append),
         )
         .arg(
+            clap::Arg::new("--check-cfg")
+                .long("check-cfg")
+                .num_args(1)
+                .action(clap::ArgAction::Append),
+        )
+        .arg(
             clap::Arg::new("--verbose")
                 .short('v')
                 .long("verbose")

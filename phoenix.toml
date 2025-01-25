@@ -46,6 +46,10 @@ lib_path = "plugins/libphoenix_transport_tcp.rlib"
 name = "Salloc"
 lib_path = "plugins/libphoenix_salloc.rlib"
 
+[[modules]]
+name = "IbProvider"
+lib_path = "plugins/libphoenix_ibprovider.rlib"
+
 # Example Prelude Addons (not in effect until being attached)
 # To get the addon, compile mRPC project.
 # [[addons]]

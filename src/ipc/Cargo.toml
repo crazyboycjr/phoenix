@@ -24,6 +24,7 @@ unique.workspace = true
 minstant.workspace = true
 mio.workspace = true
 async-io = { workspace = true, optional = true }
+anyhow.workspace = true
 
 [features]
 customer = ["dep:async-io"]
