@@ -7,7 +7,7 @@ use thiserror::Error;
 
 use ipc::service::ShmService;
 use phoenix_api::engine::SchedulingHint;
-use phoenix_api_salloc::{cmd, dp};
+use phoenix_api::salloc::{cmd, dp};
 
 const DEFAULT_PHOENIX_PREFIX: &str = "/tmp/phoenix";
 const DEFAULT_PHOENIX_CONTROL: &str = "control.sock";
