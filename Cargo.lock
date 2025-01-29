@@ -857,6 +857,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "dircpy"
+version = "0.3.19"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "a88521b0517f5f9d51d11925d8ab4523497dcf947073fa3231a311b63941131c"
+dependencies = [
+ "jwalk",
+ "log",
+ "walkdir",
+]
+
+[[package]]
 name = "dirs"
 version = "4.0.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1017,7 +1028,6 @@ dependencies = [
  "object 0.30.4",
  "petgraph",
  "phoenix-api",
- "phoenix-api-salloc 0.1.0 (git+https://github.com/phoenix-dataplane/phoenix-api?tag=v0.1.0)",
  "rand 0.8.5",
  "ringbuf",
  "rustc-demangle",
@@ -1534,6 +1544,16 @@ name = "json"
 version = "0.12.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "078e285eafdfb6c4b434e0d31e8cfcb5115b651496faca5749b88fafd4f23bfd"
+
+[[package]]
+name = "jwalk"
+version = "0.8.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "2735847566356cd2179a2a38264839308f7079fa96e6bd5a42d740460e003c56"
+dependencies = [
+ "crossbeam",
+ "rayon",
+]
 
 [[package]]
 name = "kernel32-sys"
@@ -2077,9 +2097,9 @@ dependencies = [
 name = "phoenix-api"
 version = "0.1.0"
 dependencies = [
- "phoenix-api-core 0.1.0",
+ "phoenix-api-core",
  "phoenix-api-ibprovider",
- "phoenix-api-salloc 0.1.0",
+ "phoenix-api-salloc",
  "phoenix-api-transport",
 ]
 
@@ -2097,23 +2117,10 @@ dependencies = [
 ]
 
 [[package]]
-name = "phoenix-api-core"
-version = "0.1.0"
-source = "git+https://github.com/phoenix-dataplane/phoenix-api?tag=v0.1.0#625145cf67500295eca95b8c2dcbfed0036ef34a"
-dependencies = [
- "bitflags 1.3.2",
- "libc",
- "serde",
- "static_assertions",
- "thiserror",
- "zerocopy 0.3.2",
-]
-
-[[package]]
 name = "phoenix-api-ibprovider"
 version = "0.1.0"
 dependencies = [
- "phoenix-api-core 0.1.0",
+ "phoenix-api-core",
  "serde",
  "static_assertions",
 ]
@@ -2155,17 +2162,7 @@ dependencies = [
 name = "phoenix-api-salloc"
 version = "0.1.0"
 dependencies = [
- "phoenix-api-core 0.1.0",
- "serde",
- "static_assertions",
-]
-
-[[package]]
-name = "phoenix-api-salloc"
-version = "0.1.0"
-source = "git+https://github.com/phoenix-dataplane/phoenix-api?tag=v0.1.0#625145cf67500295eca95b8c2dcbfed0036ef34a"
-dependencies = [
- "phoenix-api-core 0.1.0 (git+https://github.com/phoenix-dataplane/phoenix-api?tag=v0.1.0)",
+ "phoenix-api-core",
  "serde",
  "static_assertions",
 ]
@@ -2174,7 +2171,7 @@ dependencies = [
 name = "phoenix-api-transport"
 version = "0.1.0"
 dependencies = [
- "phoenix-api-core 0.1.0",
+ "phoenix-api-core",
  "serde",
  "static_assertions",
 ]
@@ -2314,11 +2311,13 @@ dependencies = [
  "ansi_term",
  "anyhow",
  "clap 4.5.7",
+ "dircpy",
  "getopts",
  "rayon",
  "regex",
  "semver 1.0.23",
  "serde",
+ "serde_json",
  "shlex",
  "toml",
  "walkdir",
@@ -2924,6 +2923,9 @@ name = "semver"
 version = "1.0.23"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "61697e0a1c7e512e84a621326239844a24d8207b4669b41bc18b32ea5cbf988b"
+dependencies = [
+ "serde",
+]
 
 [[package]]
 name = "semver-parser"

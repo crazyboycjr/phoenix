@@ -14,6 +14,8 @@ toml.workspace = true
 serde = { workspace = true, features = ["derive"] }
 walkdir = "2.3.2"
 shlex = "1.1.0"
-semver.workspace = true
+semver = { workspace = true, features = ["serde"] }
 rayon = "1.7.0"
 ansi_term.workspace = true
+serde_json.workspace = true
+dircpy.workspace = true

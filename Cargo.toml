@@ -120,6 +120,7 @@ libnuma = "0.0.4"
 libnuma-sys = "0.0.4"
 serde_json = "1.0.81"
 prettytable-rs = "0.9"
+dircpy = "0.3.19"
 
 bindgen = "0.69.4"
 cc = "1.0.70"

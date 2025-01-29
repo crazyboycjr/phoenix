@@ -5,8 +5,8 @@ PHOENIX_PREFIX = { value = "/tmp/phoenix", condition.env_not_set = [
 PROJECT_ROOT = { script = ["pwd"] }
 TARGET_DIR = "${PROJECT_ROOT}/target"
 PHOENIX_TARGET_DIR = "${PROJECT_ROOT}/target/phoenix"
-PHOENIX_COMPILE_LOG = "${PHOENIX_TARGET_DIR}/phoenix_compile_log.txt"
-HOST_DEP = "${PHOENIX_TARGET_DIR}/host_dep"
+PHOENIX_COMPILE_COMMANDS = "${PHOENIX_TARGET_DIR}/phoenix_compile_commands.json"
+COMMON_DEPS_DIR = "${PHOENIX_TARGET_DIR}/common_deps"
 
 [tasks.default]
 alias = "dev-test-flow"
@@ -26,6 +26,11 @@ dependencies = [
   "run-phoenixos",
 ]
 
+[tasks.phoenix_cargo]
+description = "Build phoenix_cargo tool."
+cwd = "${PROJECT_ROOT}"
+script = "cargo build --release --bin phoenix_cargo"
+
 [tasks.phoenix_common]
 description = '''
 Build phoenix-common package and deploy it to target/host_dep.
@@ -35,18 +40,13 @@ script = '''
 #!/usr/bin/env bash
 set -euo pipefail
 mkdir -p ${PHOENIX_TARGET_DIR}
-cargo build -vv --release -p phoenix_common --color=always \
-  --target-dir ${PHOENIX_TARGET_DIR} |& tee ${PHOENIX_COMPILE_LOG}.2
-mv -f ${PHOENIX_COMPILE_LOG}.2 ${PHOENIX_COMPILE_LOG}
-rm -rf ${HOST_DEP}
-cp -r ${PHOENIX_TARGET_DIR}/release/deps ${HOST_DEP}
+mkdir -p ${COMMON_DEPS_DIR}
+${TARGET_DIR}/release/phoenix_cargo \
+  --build-common-deps \
+  --compile-commands ${PHOENIX_COMPILE_COMMANDS} --common-deps ${COMMON_DEPS_DIR} -- \
+  build --release --target-dir ${PHOENIX_TARGET_DIR} -p phoenix_common
 '''
-dependencies = ["remove-fingerprint1"]
-
-[tasks.phoenix_cargo]
-description = "Build phoenix_cargo tool."
-cwd = "${PROJECT_ROOT}"
-script = "cargo build --release --bin phoenix_cargo"
+dependencies = ["phoenix_cargo"]
 
 [tasks.build-phoenixos]
 description = "Build phoenixos."
@@ -54,14 +54,10 @@ cwd = "${PROJECT_ROOT}"
 script = '''
 mkdir -p ${PHOENIX_TARGET_DIR}
 ${TARGET_DIR}/release/phoenix_cargo \
-  --compile-log ${PHOENIX_COMPILE_LOG} --host-dep ${HOST_DEP} -- \
+  --compile-commands ${PHOENIX_COMPILE_COMMANDS} --common-deps ${COMMON_DEPS_DIR} -- \
   build --release --target-dir ${PHOENIX_TARGET_DIR} -p phoenixos
 '''
-dependencies = [
-  "phoenix_common",
-  "phoenix_cargo",
-  # "remove-fingerprint2",
-]
+dependencies = ["phoenix_common"]
 
 [tasks.phoenixos]
 alias = "build-phoenixos"
@@ -87,20 +83,20 @@ If no argument is provided, build all plugins in this workspace.
 '''
 # cargo make build-plugins [package-name]*
 cwd = "${PROJECT_ROOT}"
-command = "${TARGET_DIR}/release/phoenix_cargo"
-args = [
-  "--compile-log",
-  "${PHOENIX_COMPILE_LOG}",
-  "--host-dep",
-  "${HOST_DEP}",
-  "--",
-  "build",
-  "--release",
-  "--target-dir",
-  "${PHOENIX_TARGET_DIR}",
-  "-p ${@}",
-]
-# dependencies = ["remove-fingerprint3"]
+script = '''
+default_plugins=`cargo metadata --format-version 1 | jq -r '
+  .packages[].manifest_path
+  | select(test("src/plugin"))
+  | sub("/Cargo.toml$"; "")  # Remove the /Cargo.toml part
+  | split("/") | last        # Get only the last directory name
+  | "-p phoenix-" + .
+'`
+pkgs=`test -z "$@" && echo ${default_plugins} || printf -- '-p phoenix-%s ' "$@"`
+${TARGET_DIR}/release/phoenix_cargo \
+  --compile-commands ${PHOENIX_COMPILE_COMMANDS} --common-deps ${COMMON_DEPS_DIR} -- \
+  build --release --target-dir ${PHOENIX_TARGET_DIR} \
+  ${pkgs}
+'''
 
 [tasks.deploy-plugins]
 description = "Deploy all plugins."
@@ -113,18 +109,6 @@ Build phoenix-cli tools.
 script = '''
 cargo build --release -p phoenixctl
 '''
-
-[tasks.remove-fingerprint]
-description = "Clear cargo fingerprint under target/release."
-script = '''
-rm -rf ${PHOENIX_TARGET_DIR}/release/.fingerprint
-'''
-
-# cargo-make won't run the same task twice, so we have to use aliases
-[tasks]
-remove-fingerprint1.alias = "remove-fingerprint"
-remove-fingerprint2.alias = "remove-fingerprint"
-remove-fingerprint3.alias = "remove-fingerprint"
 
 [tasks.build]
 description = "Forward everything to cargo build."

@@ -11,7 +11,7 @@ use std::collections::{BTreeSet, HashMap};
 use std::ffi::OsString;
 use std::fmt;
 use std::fs;
-use std::io;
+use std::io::{self, Write};
 use std::io::{BufRead, BufReader};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
@@ -19,9 +19,10 @@ use std::sync::{Arc, Condvar, Mutex};
 use std::thread;
 
 use ansi_term::Color;
-use anyhow::{bail, Context};
+use anyhow::{bail, Context, Result};
 use clap::Parser;
 use semver::{Version, VersionReq};
+use serde::{Deserialize, Serialize};
 
 #[derive(Clone)]
 struct Available {
@@ -74,7 +75,7 @@ struct AvailableInner {
     cvar: Condvar,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 struct Crate {
     name: String,
     metadata: String,
@@ -87,7 +88,34 @@ struct Crate {
     // initialize it later
     is_recreated: Option<bool>,
     // whether the crate has been available
+    #[serde(with = "serde_availability")]
     available: Available,
+}
+
+// Custom Serializer & Deserializer for Available
+mod serde_availability {
+    use super::*;
+    use serde::{Deserialize, Deserializer, Serializer};
+
+    pub fn serialize<S>(a: &Available, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        let value = a.inner.lock.lock().map_err(serde::ser::Error::custom)?;
+        serializer.serialize_bool(*value)
+    }
+
+    pub fn deserialize<'de, D>(deserializer: D) -> Result<Available, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let value = bool::deserialize(deserializer)?;
+        let a = Available::new();
+        if value {
+            a.make_available();
+        }
+        Ok(a)
+    }
 }
 
 impl Crate {
@@ -97,86 +125,154 @@ impl Crate {
 }
 
 /// It maps a crate-name to a list of candidate crates.
-#[derive(Debug, Clone)]
-struct PrebuiltCrates(HashMap<String, Vec<Crate>>);
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+struct CommonDeps(HashMap<String, Vec<Crate>>);
 
-impl PrebuiltCrates {
-    fn new(rustc_commands: &[String], host_dep: &Path) -> anyhow::Result<Self> {
+impl CommonDeps {
+    fn new(rustc_commands: &[String], common_deps_dir: &Path) -> Result<Self> {
         let mut crates = HashMap::default();
         for original_cmd in rustc_commands {
             let Some(mut c) = get_crate_from_rustc_command(original_cmd)? else {
                 continue;
             };
             c.is_recreated = Some(true);
-            c.path = host_dep.join(c.path.file_name().context("Could not get file_name")?);
+            c.path = common_deps_dir.join(c.path.file_name().context("Could not get file_name")?);
+            // crates in common_deps are by default available (and must be)
             c.available.make_available();
             crates
                 .entry(c.name.to_owned())
                 .or_insert_with(Vec::new)
                 .push(c);
         }
-        Ok(Self(crates))
+        Ok(CommonDeps(crates))
+    }
+
+    fn merge(&mut self, other: &CommonDeps) {
+        for (k, v) in other.0.iter() {
+            self.0
+                .entry(k.clone())
+                .or_insert_with(Vec::new)
+                .extend(v.iter().cloned());
+        }
     }
 }
 
-#[derive(Debug)]
-struct CompileDb {
-    /// The directory that contains the prebuilt crates for phoenix_common.
-    prebuilt_dir: PathBuf,
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+enum CompliationPhase {
+    Started,
+    Completed,
+}
 
-    /// The dependency closure for phoenix_common
-    prebuilt_crate_sets: PrebuiltCrates,
+#[derive(Debug, Serialize, Deserialize)]
+struct CompilationRecord {
+    is_common_dependency: bool,
+    command: String,
+    started_ts: std::time::SystemTime,
+    crate_info: Crate,
+    state: CompliationPhase,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+struct CompilationDatabase {
+    /// Path to the compile_commands.json
+    #[serde(skip)]
+    compile_commands_path: PathBuf,
+
+    /// The directory that contains the common_deps crates for `phoenix_common`.
+    common_deps_dir: PathBuf,
+
+    /// The dependency closure for `phoenix_common`. Crates in this set are common_deps and will be
+    /// used to inject into as dependencies of plugins (if they can replace any compatible
+    /// dependent crate of a plugin).
+    common_deps: CommonDeps,
 
     /// Lookup table that returns the crate information for a given cratename-metadata
     crate_info: HashMap<String, Crate>,
 }
 
-impl CompileDb {
-    fn from_file(opts: &Opts) -> anyhow::Result<Self> {
-        let compile_log_path = opts.compile_log.as_ref().unwrap().as_path();
-
-        let host_dep = fs::canonicalize(&opts.host_dep.as_ref().unwrap()).with_context(|| {
-            format!(
-                "--host-dep arg '{}' was invalid path.",
-                opts.host_dep.as_ref().unwrap().display()
+impl Drop for CompilationDatabase {
+    fn drop(&mut self) {
+        self.save_to_file().unwrap_or_else(|e| {
+            eprintln!(
+                "Failed to save to {}: {}",
+                self.compile_commands_path.display(),
+                e
             )
-        })?;
+        });
+    }
+}
 
-        let copy_to = host_dep.as_ref();
+impl CompilationDatabase {
+    fn from_opts(opts: &Opts) -> Result<Self> {
+        let compile_commands_path = opts.compile_commands.as_ref().unwrap().clone();
 
-        // Parse rustc commands
-        let compile_log_file = fs::File::open(compile_log_path)?;
-        let mut reader = BufReader::new(compile_log_file);
-        let (rustc_commands, _original_stderr) = capture_rustc_commands(&mut reader, 0);
-
-        // Extract the prebuilt_dir from the last command
-        // let last_cmd = rustc_commands
-        //     .last()
-        //     .context("No commands captured from stderr during the initial cargo command")?;
-        // let prebuilt_dir = PathBuf::from(get_out_dir_arg(last_cmd)?);
-
-        // let prebuilt_dir = fs::canonicalize(&prebuilt_dir).with_context(|| {
-        //     format!("--input arg '{}' was invalid path.", prebuilt_dir.display())
-        // })?;
-
-        // Scan all the rustc commands and build the index to the crates
-        let prebuilt_crate_sets = PrebuiltCrates::new(&rustc_commands, copy_to)?;
-
-        // Organize the crates in prebuilt set for lookup
-        let crate_info = prebuilt_crate_sets
-            .0
-            .values()
-            .flat_map(|crates| {
-                crates
-                    .iter()
-                    .map(|c| (format!("{}-{}", c.name, c.metadata), c.clone()))
+        if Path::try_exists(&compile_commands_path).with_context(|| {
+            format!(
+                "Can't check existence of file: {}",
+                compile_commands_path.display()
+            )
+        })? {
+            // The DB exists, initialize from the file
+            let compile_commands_file = fs::File::open(&compile_commands_path)?;
+            let reader = BufReader::new(compile_commands_file);
+            let mut db: CompilationDatabase = serde_json::from_reader(reader)?;
+            db.compile_commands_path = compile_commands_path;
+            Ok(db)
+        } else {
+            // Create a new empty CompilationDatabase
+            let common_deps_dir = fs::canonicalize(&opts.common_deps.as_ref().unwrap())
+                .with_context(|| {
+                    format!(
+                        "--common-deps arg '{}' was an invalid path.",
+                        opts.common_deps.as_ref().unwrap().display()
+                    )
+                })?;
+            Ok(Self {
+                compile_commands_path,
+                common_deps_dir,
+                common_deps: CommonDeps::default(),
+                crate_info: Default::default(),
             })
-            .collect();
-        Ok(Self {
-            prebuilt_dir: copy_to.to_path_buf(),
-            prebuilt_crate_sets,
-            crate_info,
-        })
+        }
+    }
+
+    fn build_common_dependencies<P: AsRef<Path>>(
+        &mut self,
+        cargo_subcommand: &[String],
+        target_dir: P,
+    ) -> Result<()> {
+        let commands = run_initial_cargo(cargo_subcommand, None, &target_dir)
+            .with_context(|| format!("run_initial_cargo failed for {:?}", cargo_subcommand))?;
+
+        // copy results from target_dir/deps to common_deps_dir
+        let profile = determine_profile(cargo_subcommand);
+        let src = target_dir.as_ref().join(profile).join("deps");
+        let msg = format!(
+            "Copy from {} to {}",
+            src.display(),
+            self.common_deps_dir.display()
+        );
+        println!("{msg}");
+        dircpy::copy_dir(&src, &self.common_deps_dir).with_context(|| format!("{} failed", msg))?;
+
+        let new_common_deps = CommonDeps::new(&commands, &self.common_deps_dir)?;
+
+        // Merge new records
+        self.common_deps.merge(&new_common_deps);
+        let new_crate_info = new_common_deps.0.values().flat_map(|crates| {
+            crates
+                .iter()
+                .map(|c| (format!("{}-{}", c.name, c.metadata), c.clone()))
+        });
+        self.crate_info.extend(new_crate_info);
+        Ok(())
+    }
+
+    fn save_to_file(&self) -> Result<()> {
+        let buf = serde_json::to_string(self)?;
+        let mut file = fs::File::create(&self.compile_commands_path)?;
+        file.write_all(buf.as_bytes())?;
+        Ok(())
     }
 
     fn mark_recreated(&mut self, c: &Crate, is_recreated: bool) {
@@ -225,12 +321,15 @@ impl CompileDb {
         }
         if recurse_level == 0 {
             // The implementation here does not check the compatibability of each crate exactly.
-            // Instead, it just checks whether a compatible one can be found in the prebuilt_set
+            // Instead, it just checks whether a compatible one can be found in the common_deps_set
             // for all direct dependencies.
             desired.dependencies.iter().all(|dep| {
                 self.get_crate(&dep)
                     .map(|dep_crate| {
-                        self.contains_compatible_crates_in_prebuilt(&dep_crate, recurse_level + 1)
+                        self.contains_compatible_crates_in_common_deps(
+                            &dep_crate,
+                            recurse_level + 1,
+                        )
                     })
                     .unwrap_or(false)
             })
@@ -239,9 +338,9 @@ impl CompileDb {
         }
     }
 
-    fn contains_compatible_crates_in_prebuilt(&self, c: &Crate, recurse_level: usize) -> bool {
+    fn contains_compatible_crates_in_common_deps(&self, c: &Crate, recurse_level: usize) -> bool {
         // TODO(cjr): Accelerate this function using a query cache.
-        self.prebuilt_crate_sets
+        self.common_deps
             .0
             .get(&c.name)
             .map(|candidate_set| {
@@ -252,8 +351,8 @@ impl CompileDb {
             .unwrap_or(false)
     }
 
-    fn find_compatible_crates_in_prebuilt(&self, c: &Crate) -> Vec<Crate> {
-        self.prebuilt_crate_sets
+    fn find_compatible_crates_in_common_deps(&self, c: &Crate) -> Vec<Crate> {
+        self.common_deps
             .0
             .get(&c.name)
             .map(|candidate_set| {
@@ -277,18 +376,24 @@ impl CompileDb {
     based on a previous build of phoenix."
 )]
 struct Opts {
+    /// The rlibs built by this command are considered common dependencies of phoenixos and its
+    /// plugins. This is a special bootstrap operation and only applies to buildling of
+    /// the `phoenix_common` crate.
+    #[arg(long)]
+    build_common_deps: bool,
+
     /// The dep file that specifies the dependencies of a latest build of phoenix_common.
     ///
-    /// If not specified, it will be the phoenix/phoneix_compile_log.txt under the target_dir
+    /// If not specified, it will be the phoenix/phoneix_compile_commands.json under the target_dir
     /// for this build.
     #[arg(long)]
-    compile_log: Option<PathBuf>,
+    compile_commands: Option<PathBuf>,
 
     /// The path to the phoenix_common dependencies we will copy to.
     ///
-    /// If not specified, it will be the phoenix/host_dep under the target_dir for this build.
+    /// If not specified, it will be the phoenix/common_deps under the target_dir for this build.
     #[arg(long)]
-    host_dep: Option<PathBuf>,
+    common_deps: Option<PathBuf>,
 
     /// Cargo subcommand
     #[arg(raw = true, allow_hyphen_values = true)]
@@ -305,7 +410,7 @@ fn is_build_command(cargo_subcommand: &[String]) -> bool {
 /// Returns the project's workspace root.
 ///
 /// It is equivalent to running cargo locate-project --workspace [--manifest-path some_path].
-fn locate_project_root(cargo_subcommand: &[String]) -> anyhow::Result<PathBuf> {
+fn locate_project_root(cargo_subcommand: &[String]) -> Result<PathBuf> {
     let mut cmd = Command::new("cargo");
     cmd.arg("locate-project").arg("--workspace");
 
@@ -346,39 +451,38 @@ fn locate_project_root(cargo_subcommand: &[String]) -> anyhow::Result<PathBuf> {
     Ok(bcx_root.to_path_buf())
 }
 
+/// Returns the default target_dir, which is bcx_root/target/phoenix
+fn default_target_dir(cargo_subcommand: &[String]) -> Result<PathBuf> {
+    // Determine the cargo root workspace directory
+    let bcx_root = locate_project_root(cargo_subcommand).with_context(|| {
+        format!(
+            "Unable to determine project root, subcommand: {:?}",
+            cargo_subcommand
+        )
+    })?;
+
+    Ok(bcx_root.join("target").join("phoenix"))
+}
+
 /// Returns the target-dir for this build.
 ///
 /// It returns the value of `--target-dir` is it is present. Otherwise, it returns bcx_root/target.
-fn locate_target_dir(cargo_subcommand: &[String], bcx_root: &Path) -> PathBuf {
+fn locate_target_dir(cargo_subcommand: &[String]) -> Result<PathBuf> {
     // determine the target-dir in the following order
     // 1. --target-dir command-line flag
-    // 2. build.target-dir config value
-    // 3. env CARGO_TARGET_DIR/CARGO_BUILD_TARGET_DIR
-    // 4. default: bcx_root/target
+    // 2. build.target-dir config value (not implemented)
+    // 3. env CARGO_TARGET_DIR/CARGO_BUILD_TARGET_DIR (not implemented)
+    // 4. default: bcx_root/target/phoenix
     cargo_subcommand
         .iter()
         .position(|arg| arg == "--target-dir")
-        .map(|pos| PathBuf::from(&cargo_subcommand[pos + 1]))
-        .unwrap_or_else(|| bcx_root.join("target").join("phoenix"))
-
-    // let cargo_config = cargo::util::config::Config::default()?;
-    // cargo_config.configure(
-    //     0,
-    //     false,
-    //     None,
-    //     false,
-    //     false,
-    //     true,
-    //     &args_target_dir,
-    //     &[],
-    //     &[],
-    // )?;
-
-    // let ws = cargo::core::Workspace::new(&bcx_root.join("Cargo.toml"), &cargo_config)?;
-    // Ok(PathBuf::new())
+        .map_or_else(
+            || default_target_dir(cargo_subcommand),
+            |pos| Ok(PathBuf::from(&cargo_subcommand[pos + 1])),
+        )
 }
 
-fn determine_profile_dir(cargo_subcommand: &[String]) -> String {
+fn determine_profile(cargo_subcommand: &[String]) -> String {
     // I couldn't find a more reliable yet simple way to do this unless follow the cargo's source
     // code to parse, initialize workspace, and expand the command alias
     if cargo_subcommand
@@ -396,55 +500,37 @@ fn determine_profile_dir(cargo_subcommand: &[String]) -> String {
     }
 }
 
-fn main() -> anyhow::Result<()> {
+
+fn main() -> Result<()> {
     let mut opts = Opts::parse();
 
-    // Determine the cargo root workspace directory
-    // dbg!(&opts.cargo_subcommand);
-    let cargo_bcx_root = locate_project_root(&opts.cargo_subcommand)?;
+    // Determine the target dir for this build
+    let target_dir = locate_target_dir(&opts.cargo_subcommand)?;
 
-    // First pass, do not touch .fingerprint, set RUSTC_WRAPPER=echo, and capture the stderr
-    // Since we could run from a last failed or interrupted build, we need to recover the old
-    // fingerprint directory.
-    let target_dir = locate_target_dir(&opts.cargo_subcommand, &cargo_bcx_root);
-    let profile_dir = determine_profile_dir(&opts.cargo_subcommand);
-
-    // Adjust `compile_log` and `host_dep` according to cargo_subcommand if not set by the user
-    if opts.compile_log.is_none() {
-        opts.compile_log = Some(target_dir.join("phoenix_compile_log.txt"));
+    // Adjust `compile_commands` and `common_deps` according to cargo_subcommand if not set by the user
+    if opts.compile_commands.is_none() {
+        opts.compile_commands = Some(target_dir.join("phoenix_compile_commands.json"));
     }
-    if opts.host_dep.is_none() {
-        opts.host_dep = Some(target_dir.join("host_dep"));
+    if opts.common_deps.is_none() {
+        opts.common_deps = Some(target_dir.join("common_deps"));
     }
 
     // Initialize the compile database from the cargo's log file.
     // This log file should be the file generated during building package phoenix_common.
-    let mut compile_db = CompileDb::from_file(&opts)?;
+    let mut compile_db = CompilationDatabase::from_opts(&opts)?;
 
     dbg!(&compile_db);
 
-    let verbose_count = count_verbose_arg(&opts.cargo_subcommand);
+    if opts.build_common_deps {
+        compile_db
+            .build_common_dependencies(&opts.cargo_subcommand, &target_dir)
+            .context("build_common_dependencies failed")?;
+        return Ok(());
+    }
 
-    // phoenix_cargo builds in three passes.
-    recover_fingerprint_directory(&target_dir, &profile_dir)?;
-    // let first_pass_stderr_captured = run_initial_cargo(&opts.cargo_subcommand, verbose_count)?;
-
-    // if !is_build_command(&opts.cargo_subcommand) {
-    //     println!("Exiting after completing non-'build' cargo command.");
-    //     return Ok(());
-    // }
-
-    // Second pass, rename .fingerprint and do a fresh build, capture the full compilation
-    // information and rename .fingerprint back
-    // Determine the target dir for this build
-    let second_pass_stderr_captured = {
-        // Here, temporarily remove the ".fingerprint/` directory, in order to force rustc
-        // to rebuild all artifacts for all of the modified rustc commands to capture the
-        // informatino to build compile db.
-        let _guard = FingerprintDirGuard::new(&target_dir, &profile_dir)?;
-
-        run_initial_cargo(&opts.cargo_subcommand, verbose_count, &target_dir)?
-    };
+    // phoenix_cargo builds in two passes.
+    // First pass: set RUSTC_WRAPPER=echo, and capture the stderr for incremental compile log.
+    let first_pass_stderr_captured = run_initial_cargo(&opts.cargo_subcommand, None, &target_dir)?;
 
     if !is_build_command(&opts.cargo_subcommand) {
         println!("Exiting after completing non-'build' cargo command.");
@@ -452,8 +538,8 @@ fn main() -> anyhow::Result<()> {
     }
 
     {
-        // Final pass, re-run the commands captured in the first stage, modify the extern arguments
-        // based on the matched crates in the compile database.
+        // Second pass, re-run the commands captured in the first stage, modify the extern arguments
+        // based on the matched crates in the compilation database.
 
         // Change working directory
         if let Some(manifest_path) = opts
@@ -474,25 +560,27 @@ fn main() -> anyhow::Result<()> {
 
         // Now that we have run the initial cargo build, it has created many redundant dependency artifacts
         // in the local crate's target/ directory, namely the locally re-built versions of phoenix crates,
-        // specifically all the crates that are in the set of prebuilt crates.
+        // specifically all the crates that are in the set of common_deps.
+        // let last_cmd = first_pass_stderr_captured
+        //     .last()
+        //     .context("No commands captured from stderr during the initial cargo command")?;
+        // let out_dir = PathBuf::from(get_out_dir_arg(last_cmd)?);
+
         // We need to remove those redundant files from the local target/ directory (the "out-dir")
         // such that when we re-issue the rustc commands below, it won't fail with an error about
         // multiple "potentially newer" versions of a given crate dependency.
-        let last_cmd = second_pass_stderr_captured
-            .last()
-            .context("No commands captured from stderr during the initial cargo command")?;
-        let out_dir = PathBuf::from(get_out_dir_arg(last_cmd)?);
-
-        remove_redundant_artifacts(&compile_db, out_dir)?;
+        // remove_redundant_artifacts(&compile_db, out_dir)?;
 
         // Re-execute the rustc commands that we captured from the original cargo verbose output.
         rayon::scope(|s| {
-            for original_cmd in &second_pass_stderr_captured {
-                // This function will only re-run rustc for crates that don't already exist in the set of prebuilt crates.
+            for original_cmd in &first_pass_stderr_captured {
+                // This function will only re-run rustc for crates that don't already exist in the set of common_deps common_dep crates.
                 if let Some(mut task) = run_rustc_command(original_cmd, &mut compile_db).unwrap() {
                     s.spawn(move |_s| {
                         for dep in task.dependencies {
+                            println!("waiting for dep: {}", dep.0);
                             dep.1.wait();
+                            println!("resolved dep: {}", dep.0);
                         }
 
                         // Finally, we run the recreated rustc command.
@@ -665,9 +753,11 @@ fn capture_rustc_commands<R: io::Read>(
 /// Returns the captured content of content written to `stderr` by the cargo command, as a list of lines.
 fn run_initial_cargo<P: AsRef<Path>>(
     full_args: &[String],
-    verbose_level: usize,
+    rustc_wrapper: Option<PathBuf>,
     target_dir: P,
-) -> anyhow::Result<Vec<String>> {
+) -> Result<Vec<String>> {
+    let verbose_level = count_verbose_arg(full_args);
+
     let subcommand = full_args
         .first()
         .context("Missing subcommand argument to `phoenix_cargo` (e.g., `build`)")?;
@@ -699,18 +789,13 @@ fn run_initial_cargo<P: AsRef<Path>>(
     // Use full color output to get a regular terminal-esque display from cargo
     cmd.arg("--color=always");
 
-    // RUSTC_WRAPPER=echo
-    // cmd.env("RUSTC_WRAPPER", "echo");
+    // RUSTC_WRAPPER=echo, but faithfully executes when parent process is build-script-build
+    if let Some(rustc_wrapper) = rustc_wrapper {
+        cmd.env("RUSTC_WRAPPER", rustc_wrapper.display().to_string());
+    }
 
     cmd.env("CARGO_TARGET_DIR", target_dir.as_ref());
 
-    // TODO: Add the requisite environment variables to configure cargo such that rustc builds with the
-    // proper config.
-    // cmd.env("RUST_TARGET_PATH");
-
-    // Cargo will directly use the rustflags read from .cargo/config.toml if RUSTFLAGS not set.
-    // Add the sysroot argument to our rustflags so cargo will use our pre-built phoenix dependencies.
-    // let mut rustflags = format!("--sysroot {}", sysroot_dir_path.display());
     // let mut rustflags = String::new();
 
     // -Zbinary-dep-depinfo allows us to track dependencies of each rlib
@@ -777,9 +862,7 @@ fn ignore_arg(arg: &str) -> bool {
     arg == "--error-format" || arg == "--json"
 }
 
-fn parse_rustc_command(
-    original_cmd: &str,
-) -> anyhow::Result<Option<(String, &str, clap::ArgMatches)>> {
+fn parse_rustc_command(original_cmd: &str) -> Result<Option<(String, &str, clap::ArgMatches)>> {
     let command = if original_cmd.starts_with(COMMAND_START) && original_cmd.ends_with(COMMAND_END)
     {
         let end_index = original_cmd.len() - COMMAND_END.len();
@@ -850,7 +933,7 @@ fn parse_rustc_command(
     )))
 }
 
-fn get_crate_from_rustc_command(original_cmd: &str) -> anyhow::Result<Option<Crate>> {
+fn get_crate_from_rustc_command(original_cmd: &str) -> Result<Option<Crate>> {
     let Some((rustc_env_vars, command_without_env, top_level_matches)) =
         parse_rustc_command(original_cmd)?
     else {
@@ -987,10 +1070,10 @@ struct RustcTask {
 
 /// Takes the given `original_cmd` that was captured from the verbose output of cargo,
 /// and parses/modifies it to link against (depend on) the corresponding crate of the same name
-/// from the list of prebuilt crates.
+/// from the list of common_deps crates.
 ///
-/// The actual dependency files (.rmeta/.rlib) for the prebuilt crates should be located in the
-/// `prebuilt_dir`.
+/// The actual dependency files (.rmeta/.rlib) for the common_deps crates should be located in the
+/// `common_deps_dir`.
 /// The target specification JSON file should be found in the `target_dir_path`.
 /// These two directories are usually the same directory.
 ///
@@ -998,13 +1081,13 @@ struct RustcTask {
 /// * Returns `Ok(task)` that contains that rustc task about to execute.
 /// * Returns `Ok(None)` if no action needs to be taken.
 ///   This occurs if `original_cmd` is for building a build script (currently ignored),
-///   or if `original_cmd` is for building a crate that already exists in the set of `prebuilt_crates`.
+///   or if `original_cmd` is for building a crate that already exists in the set of `common_deps_crates`.
 /// * Returns an error if the command fails to parse.
 fn run_rustc_command(
     original_cmd: &str,
-    compile_db: &mut CompileDb,
-) -> anyhow::Result<Option<RustcTask>> {
-    let prebuilt_dir = compile_db.prebuilt_dir.clone();
+    compile_db: &mut CompilationDatabase,
+) -> Result<Option<RustcTask>> {
+    let common_deps_dir = compile_db.common_deps_dir.clone();
 
     let Some(c) = get_crate_from_rustc_command(original_cmd)? else {
         // skip invocations of build scripts
@@ -1026,7 +1109,7 @@ fn run_rustc_command(
         .get_crate(&crate_name_with_hash)
         .unwrap_or_else(|| panic!("Found no crate named: {:?}", crate_name_with_hash));
     if !compile_db
-        .find_compatible_crates_in_prebuilt(&crate_to_build)
+        .find_compatible_crates_in_common_deps(&crate_to_build)
         .is_empty()
     {
         println!(
@@ -1151,7 +1234,8 @@ fn run_rustc_command(
                     args_or_deps_changed |= extern_crate
                         .is_recreated
                         .expect("field `is_recreated` not properly initialized");
-                    let candidates = compile_db.find_compatible_crates_in_prebuilt(&extern_crate);
+                    let candidates =
+                        compile_db.find_compatible_crates_in_common_deps(&extern_crate);
                     if candidates.len() > 1 {
                         println!(
                             "WARNING: found multiple candidates: {:?}, using the first one",
@@ -1159,23 +1243,23 @@ fn run_rustc_command(
                         );
                     }
                     if !candidates.is_empty() {
-                        let prebuilt_crate = candidates.first().unwrap();
+                        let common_deps_crate = candidates.first().unwrap();
                         let msg = format!(
-                            "{} {} with prebuilt crate at {} ({:?})",
+                            "{} {} with common_deps crate at {} ({:?})",
                             Color::Yellow.paint("#### Replacing crate"),
                             Color::Blue.paint(format!("{:?}", extern_crate_name)),
-                            prebuilt_crate.path.display(),
-                            prebuilt_crate,
+                            common_deps_crate.path.display(),
+                            common_deps_crate,
                         );
                         println!("{}", msg);
                         new_value =
-                            format!("{}={}", extern_crate_name, prebuilt_crate.path.display())
+                            format!("{}={}", extern_crate_name, common_deps_crate.path.display())
                                 .into();
                         args_or_deps_changed = true;
 
                         dependencies.push((
-                            prebuilt_crate.path.display().to_string(),
-                            prebuilt_crate.available.clone(),
+                            common_deps_crate.path.display().to_string(),
+                            common_deps_crate.available.clone(),
                         ));
                     } else {
                         dependencies.push((
@@ -1218,13 +1302,13 @@ fn run_rustc_command(
     // If any args actually changed, we need to run the re-created command.
     compile_db.mark_recreated(&c, args_or_deps_changed);
     if args_or_deps_changed {
-        // Add our directory of prebuilt crates as a library search path, for dependency resolution.
+        // Add our directory of common_deps crates as a library search path, for dependency resolution.
         // This is okay because we removed all of the potentially conflicting crates from the local target/ directory,
-        // which ensures that adding in the directory of prebuilt crate .rmeta/.rlib files won't cause rustc to complain
+        // which ensures that adding in the directory of common_deps crate .rmeta/.rlib files won't cause rustc to complain
         // about multiple "potentially newer" versions of a given crate.
-        recreated_cmd.arg("-L").arg(prebuilt_dir);
-        // We also need to add the directory of host dependencies, e.g., proc macro crates and such.
-        // recreated_cmd.arg("-L").arg(host_deps_dir_path);
+        recreated_cmd.arg("-L").arg(common_deps_dir);
+        // We also need to add the directory of common dependencies, e.g., proc macro crates and such.
+        // recreated_cmd.arg("-L").arg(TBD);
 
         println!("rustc_env_vars: {}", rustc_env_vars);
         for env in shlex::split(&rustc_env_vars).unwrap() {
@@ -1232,6 +1316,11 @@ fn run_rustc_command(
                 .split_once('=')
                 .unwrap_or_else(|| panic!("env: {}", env));
             recreated_cmd.env(k, v);
+        }
+
+        // Suppress warnings for dependency crates
+        if !c.is_primary {
+            recreated_cmd.arg("-Awarnings");
         }
         // println!("\n\n--------------- Inherited Environment Variables ----------------\n");
         // let _env_cmd = Command::new("env").spawn().unwrap().wait().unwrap();
@@ -1259,7 +1348,7 @@ fn run_rustc_command(
     }))
 }
 
-fn copy_result(c: &Crate) -> anyhow::Result<()> {
+fn copy_result(c: &Crate) -> Result<()> {
     // copy the library
     let destdir = c.path.parent().unwrap().parent().unwrap();
     let (result_name, is_binary) = if let Some(ext) = c.path.extension() {
@@ -1494,128 +1583,8 @@ fn get_out_dir_arg(cmd_str: &str) -> anyhow::Result<String> {
         .context("--out-dir argument did not have a value")
 }
 
-#[allow(unused)]
-fn remove_fingerprint_directory<P: AsRef<Path>>(fingerprint_dir: P) -> anyhow::Result<()> {
-    let fingerprint_dir_path = fingerprint_dir.as_ref();
-    println!(
-        "--> Removing .fingerprint directory: {}",
-        fingerprint_dir_path.display()
-    );
-    fs::remove_dir_all(&fingerprint_dir_path).with_context(|| {
-        format!(
-            "Failed to remove .fingerprint directory: {}",
-            fingerprint_dir_path.display(),
-        )
-    })?;
-    Ok(())
-}
-
-/// Move cargo's 1.fingerprint` directory temporarily.
-///
-/// Rename it back when this guard is dropped.
-///
-/// If the `.fingerprint` does not exist at all, it will return an error.
-struct FingerprintDirGuard {
-    target_dir: PathBuf,
-}
-
-impl FingerprintDirGuard {
-    fn new<P: AsRef<Path>>(target_dir: P, profile_dir: &str) -> anyhow::Result<Self> {
-        let target_dir = target_dir.as_ref().to_path_buf().join(profile_dir);
-        let fingerprint_dir = target_dir.join(".fingerprint");
-        let renamed_fingerprint_dir = target_dir.join(".fingerprint.orig");
-        Self::move_dir(&fingerprint_dir, &renamed_fingerprint_dir)?;
-        Ok(Self { target_dir })
-    }
-
-    fn move_dir(from: &Path, to: &Path) -> anyhow::Result<()> {
-        println!(
-            "--> Moving .fingerprint directory from {} to {}",
-            from.display(),
-            to.display(),
-        );
-        if to.exists() && to.is_dir() {
-            fs::remove_dir_all(&to).with_context(|| {
-                format!("Failed to remove .fingerprint directory: {}", to.display())
-            })?;
-        }
-        let result = fs::rename(from, to);
-        match result {
-            Ok(_) => Ok(()),
-            Err(err) => {
-                // If the error is `Invalid cross-device link (os error 18)`, we fallback to copy and delete
-                if let Some(18) = err.raw_os_error() {
-                    Self::copy_dir_recursively(from, to).with_context(|| {
-                        format!(
-                            "Failed to copy .fingerprint directory recursively from {} to {}",
-                            from.display(),
-                            to.display(),
-                        )
-                    })?;
-                    fs::remove_dir_all(&from).with_context(|| {
-                        format!(
-                            "Failed to remove .fingerprint directory: {}",
-                            from.display(),
-                        )
-                    })?;
-                    Ok(())
-                } else {
-                    Err(err).with_context(|| {
-                        format!(
-                            "Failed to move .fingerprint directory from {} to {}",
-                            from.display(),
-                            to.display(),
-                        )
-                    })
-                }
-            }
-        }
-    }
-
-    fn copy_dir_recursively(source: &Path, destination: &Path) -> anyhow::Result<()> {
-        fs::create_dir_all(&destination)?;
-        for entry in fs::read_dir(source)? {
-            let entry = entry?;
-            let filetype = entry.file_type()?;
-            if filetype.is_dir() {
-                Self::copy_dir_recursively(&entry.path(), &destination.join(entry.file_name()))?;
-            } else {
-                fs::copy(entry.path(), destination.join(entry.file_name()))?;
-            }
-        }
-        Ok(())
-    }
-}
-
-/// Recovers the fingerprint directory.
-///
-/// If phoenix_cargo is interrupted or quits during the second pass, the temporarily
-/// fingerprint directory `.fingerprint.orig` is present on the file system and that one should
-/// be the one in use.
-fn recover_fingerprint_directory<P: AsRef<Path>>(
-    target_dir: P,
-    profile_dir: &str,
-) -> anyhow::Result<()> {
-    let target_dir = target_dir.as_ref().join(profile_dir);
-    let fingerprint_dir = target_dir.join(".fingerprint");
-    let renamed_fingerprint_dir = target_dir.join(".fingerprint.orig");
-    if renamed_fingerprint_dir.exists() {
-        FingerprintDirGuard::move_dir(&renamed_fingerprint_dir, &fingerprint_dir)?;
-    }
-    Ok(())
-}
-
-impl Drop for FingerprintDirGuard {
-    fn drop(&mut self) {
-        let fingerprint_dir = self.target_dir.join(".fingerprint");
-        let renamed_fingerprint_dir = self.target_dir.join(".fingerprint.orig");
-        Self::move_dir(&renamed_fingerprint_dir, &fingerprint_dir)
-            .expect("Failed to fingerprint directory back");
-    }
-}
-
 fn remove_redundant_artifacts<P: AsRef<Path>>(
-    compile_db: &CompileDb,
+    compile_db: &CompilationDatabase,
     out_dir: P,
 ) -> anyhow::Result<()> {
     for entry in fs::read_dir(&out_dir)? {
@@ -1670,11 +1639,12 @@ fn remove_redundant_artifacts<P: AsRef<Path>>(
             }
         };
 
-        // See if that crate already exists in our set of prebuilt crates.
-        if compile_db
-            .get_crate(crate_name_with_hash)
-            .map(|c| !compile_db.find_compatible_crates_in_prebuilt(&c).is_empty())
-            == Some(true)
+        // See if that crate already exists in our set of common_deps crates.
+        if compile_db.get_crate(crate_name_with_hash).map(|c| {
+            !compile_db
+                .find_compatible_crates_in_common_deps(&c)
+                .is_empty()
+        }) == Some(true)
         {
             // remove the redundant file
             println!("### Removing redundant crate file {}", path.display());

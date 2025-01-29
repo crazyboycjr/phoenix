@@ -268,8 +268,9 @@ impl SymbolLookupTable {
             "__tls_get_addr" => return Some((phoenix_tls_get_addr as *const ()).addr()),
             "__rust_probestack" => return Some((__rust_probestack as *const ()).addr()),
             "pthread_atfork" => return Some((libc::pthread_atfork as *const ()).addr()),
-            // On some older systems (e.g., ubuntu 20.04), glibc does not contain the symbol fstat
-            "fstat" => return Some((__fstat as *const ()).addr()),
+            // On some older systems (e.g., ubuntu 20.04), fstat symbol in not present in glibc
+            // On other systems, __fstat may not be present
+            "fstat" => return Some((fstat as *const ()).addr()),
             _ => {}
         }
 
@@ -305,8 +306,8 @@ pub(crate) struct ExtraSymbol {
     pub(crate) trampoline: [u8; 8],
 }
 
-// special symbols that dlsym cannot find
+// static hidden symbols that dlsym cannot find
 extern "C" {
     pub fn __rust_probestack();
-    pub fn __fstat();
+    pub fn fstat();
 }
