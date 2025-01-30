@@ -23,7 +23,7 @@ tracing-chrome.workspace = true
 anyhow.workspace = true
 thiserror.workspace = true
 num_cpus.workspace = true
-nix = { workspace = true, default-features = false, features = ["signal", "process"] }
+nix = { workspace = true, features = ["signal", "process"] }
 libc.workspace = true
 serde = { workspace = true, features = ["derive"] }
 bincode.workspace = true

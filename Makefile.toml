@@ -103,9 +103,7 @@ description = "Deploy all plugins."
 script = "${PROJECT_ROOT}/scripts/deploy_plugins.sh ${PHOENIX_PREFIX} ${PHOENIX_TARGET_DIR}"
 
 [tasks.build-phoenix-cli]
-description = '''
-Build phoenix-cli tools.
-'''
+description = "Build phoenix-cli tools."
 script = '''
 cargo build --release -p phoenixctl
 '''

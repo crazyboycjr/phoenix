@@ -18,7 +18,7 @@ memfd.workspace = true
 memmap2.workspace = true
 uuid.workspace = true
 atomic-traits.workspace = true
-nix = { workspace = true, default-features = false, features = ["process"] }
+nix = { workspace = true, features = ["process"] }
 crossbeam.workspace = true
 unique.workspace = true
 minstant.workspace = true

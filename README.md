@@ -30,13 +30,13 @@ $ git clone git@github.com:phoenix-dataplane/phoenix.git --recursive
 ```
 
 2. Install required packages.
-Make sure you have `libibverbs`, `librdmacm`, `libnuma`, `protoc`, `libclang`, and
+Make sure you have `libibverbs`, `librdmacm`, `libnuma`, `protoc`, `libclang`, `jq` and
 `cmake` available on your system.
 Additionally, you need to have `rustup`, `cargo-make`, and `cargo-c` installed.
 For Ubuntu 22.04, you can use the following commands:
 ```
 $ sudo apt update
-$ sudo apt install libclang-dev libnuma-dev librdmacm-dev libibverbs-dev protobuf-compiler cmake
+$ sudo apt install libclang-dev libnuma-dev librdmacm-dev libibverbs-dev protobuf-compiler cmake jq
 $ curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
 $ cargo install cargo-binstall && cargo binstall cargo-make cargo-c -y
 ```

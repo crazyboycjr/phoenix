@@ -20,7 +20,7 @@ tracing.workspace = true
 anyhow.workspace = true
 thiserror.workspace = true
 crossbeam.workspace = true
-nix = { workspace = true, default-features = false, features = ["signal", "process"] }
+nix = { workspace = true, features = ["signal", "process"] }
 fnv.workspace = true
 futures = { workspace = true, features = ["executor", "thread-pool"] }
 tokio = { workspace = true, features = ["sync"] }

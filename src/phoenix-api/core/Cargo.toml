@@ -1,0 +1,18 @@
+[package]
+name = "phoenix-api-core"
+version = "0.1.0"
+edition = "2021"
+
+# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+
+[dependencies]
+serde = { version = "1.0.130", features = ["derive"] }
+libc = "0.2.103"
+thiserror = "1.0.29"
+anyhow = "1.0.58"
+bitflags = "1.3.2"
+static_assertions = "1.1.0"
+zerocopy = "0.3.0"
+
+[features]
+mrpc = []
