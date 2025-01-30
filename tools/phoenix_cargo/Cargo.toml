@@ -18,4 +18,7 @@ semver = { workspace = true, features = ["serde"] }
 rayon = "1.7.0"
 ansi_term.workspace = true
 serde_json.workspace = true
-dircpy.workspace = true
+dircpy = "0.3.19"
+termcolor = "1.4.1"
+atty = "0.2.14"
+libc.workspace = true

@@ -15,6 +15,7 @@ use std::io::{self, Write};
 use std::io::{BufRead, BufReader};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
+use std::sync::mpsc;
 use std::sync::{Arc, Condvar, Mutex};
 use std::thread;
 
@@ -23,6 +24,9 @@ use anyhow::{bail, Context, Result};
 use clap::Parser;
 use semver::{Version, VersionReq};
 use serde::{Deserialize, Serialize};
+
+pub mod shell;
+use shell::Shell;
 
 #[derive(Clone)]
 struct Available {
@@ -500,7 +504,6 @@ fn determine_profile(cargo_subcommand: &[String]) -> String {
     }
 }
 
-
 fn main() -> Result<()> {
     let mut opts = Opts::parse();
 
@@ -530,89 +533,128 @@ fn main() -> Result<()> {
 
     // phoenix_cargo builds in two passes.
     // First pass: set RUSTC_WRAPPER=echo, and capture the stderr for incremental compile log.
-    let first_pass_stderr_captured = run_initial_cargo(&opts.cargo_subcommand, None, &target_dir)?;
+    let rustc_wrapper = PathBuf::from("scripts/rustc_wrapper.rs").canonicalize()?;
+    let first_pass_stderr_captured =
+        run_initial_cargo(&opts.cargo_subcommand, Some(rustc_wrapper), &target_dir)?;
+
+    dbg!(&first_pass_stderr_captured);
 
     if !is_build_command(&opts.cargo_subcommand) {
         println!("Exiting after completing non-'build' cargo command.");
         return Ok(());
     }
 
+    // Second pass, re-run the commands captured in the first stage, modify the extern arguments
+    // based on the matched crates in the compilation database.
+
+    // Change working directory
+    if let Some(manifest_path) = opts
+        .cargo_subcommand
+        .iter()
+        .position(|arg| arg == "--manifest-path")
+        .map(|pos| opts.cargo_subcommand[pos + 1].clone())
     {
-        // Second pass, re-run the commands captured in the first stage, modify the extern arguments
-        // based on the matched crates in the compilation database.
+        let manifest_path = fs::canonicalize(&manifest_path)?;
+        let manifest_dir = manifest_path.parent().with_context(|| {
+            format!(
+                "manifest_path has no parent directory: {}",
+                manifest_path.display()
+            )
+        })?;
+        std::env::set_current_dir(manifest_dir)?;
+    }
 
-        // Change working directory
-        if let Some(manifest_path) = opts
-            .cargo_subcommand
-            .iter()
-            .position(|arg| arg == "--manifest-path")
-            .map(|pos| opts.cargo_subcommand[pos + 1].clone())
-        {
-            let manifest_path = fs::canonicalize(&manifest_path)?;
-            let manifest_dir = manifest_path.parent().with_context(|| {
-                format!(
-                    "manifest_path has no parent directory: {}",
-                    manifest_path.display()
-                )
-            })?;
-            std::env::set_current_dir(manifest_dir)?;
-        }
+    // Now that we have run the initial cargo build, it has created many redundant dependency artifacts
+    // in the local crate's target/ directory, namely the locally re-built versions of phoenix crates,
+    // specifically all the crates that are in the set of common_deps.
+    // let last_cmd = first_pass_stderr_captured
+    //     .last()
+    //     .context("No commands captured from stderr during the initial cargo command")?;
+    // let out_dir = PathBuf::from(get_out_dir_arg(last_cmd)?);
 
-        // Now that we have run the initial cargo build, it has created many redundant dependency artifacts
-        // in the local crate's target/ directory, namely the locally re-built versions of phoenix crates,
-        // specifically all the crates that are in the set of common_deps.
-        // let last_cmd = first_pass_stderr_captured
-        //     .last()
-        //     .context("No commands captured from stderr during the initial cargo command")?;
-        // let out_dir = PathBuf::from(get_out_dir_arg(last_cmd)?);
+    // We need to remove those redundant files from the local target/ directory (the "out-dir")
+    // such that when we re-issue the rustc commands below, it won't fail with an error about
+    // multiple "potentially newer" versions of a given crate dependency.
+    // remove_redundant_artifacts(&compile_db, out_dir)?;
 
-        // We need to remove those redundant files from the local target/ directory (the "out-dir")
-        // such that when we re-issue the rustc commands below, it won't fail with an error about
-        // multiple "potentially newer" versions of a given crate dependency.
-        // remove_redundant_artifacts(&compile_db, out_dir)?;
+    // Re-execute the rustc commands that we captured from the original cargo verbose output.
+    rayon::scope(|s| {
+        let verbose_level = count_verbose_arg(&opts.cargo_subcommand);
+        let mut shell = Shell::new();
+        let (sender, receiver) = mpsc::channel();
 
-        // Re-execute the rustc commands that we captured from the original cargo verbose output.
-        rayon::scope(|s| {
-            for original_cmd in &first_pass_stderr_captured {
-                // This function will only re-run rustc for crates that don't already exist in the set of common_deps common_dep crates.
-                if let Some(mut task) = run_rustc_command(original_cmd, &mut compile_db).unwrap() {
-                    s.spawn(move |_s| {
-                        for dep in task.dependencies {
-                            println!("waiting for dep: {}", dep.0);
-                            dep.1.wait();
-                            println!("resolved dep: {}", dep.0);
-                        }
-
-                        // Finally, we run the recreated rustc command.
-                        let mut rustc_process = task
-                            .recreated_cmd
-                            .spawn()
-                            .expect("Failed to run cargo command");
-                        let exit_status = rustc_process.wait().expect("Error running rustc");
-
-                        match exit_status.code() {
-                            Some(0) => {
-                                println!(
-                                    "{} {}: Ran rustc command (modified for Phoenix) successfully.",
-                                    task.c.name, task.c.pkg_version
-                                );
-
-                                // Copy the compilation result to the parent directory of deps, just like what cargo
-                                // would do.
-                                if task.c.is_primary {
-                                    copy_result(&task.c).unwrap();
-                                }
-
-                                task.c.available.make_available();
-                            }
-                            Some(code) => panic!("rustc command exited with failure code {}", code),
-                            _ => panic!("rustc command failed and was killed."),
-                        }
-                    });
+        let mut shell_print = |(pkg_name, pkg_version)| -> Result<()> {
+            // TODO(cjr): pass cmd_str and display_env_str
+            match verbose_level {
+                0 => shell.status("Compiling", format!("{pkg_name} v{pkg_version}"))?,
+                1 => shell.status("Running", format!("{pkg_name} {pkg_version}"))?,
+                2.. => {
+                    shell.status("Compiling", format!("{pkg_name} v{pkg_version}"))?;
+                    shell.status("Running", format!("{pkg_name} {pkg_version}"))?;
                 }
             }
-        });
-    }
+            Ok(())
+        };
+
+        for original_cmd in &first_pass_stderr_captured {
+            match receiver.try_recv() {
+                Err(_) => {},
+                Ok(print_task) => {
+                    shell_print(print_task).unwrap_or_else(|e| panic!("shell_print failed: {e}"))
+                }
+            }
+
+            // This function will only re-run rustc for crates that don't already exist in the set of common_deps common_dep crates.
+            if let Some(mut task) = run_rustc_command(original_cmd, &mut compile_db).unwrap() {
+                let sender = sender.clone();
+                s.spawn(move |_s| {
+                    for dep in task.dependencies {
+                        println!("waiting for dep: {}", dep.0);
+                        dep.1.wait();
+                        println!("resolved dep: {}", dep.0);
+                    }
+
+                    // Finally, we run the recreated rustc command.
+                    // set_file_mtime("invoked.timestamp", FileTime::now()).unwrap();
+                    let mut rustc_process = task
+                        .recreated_cmd
+                        .spawn()
+                        .expect("Failed to run cargo command");
+
+                    // Send to main thread to print status message
+                    sender
+                        .send((task.c.name.clone(), task.c.pkg_version.clone()))
+                        .unwrap_or_else(|e| panic!("fail to send to mpsc::channel: {e}"));
+
+                    let exit_status = rustc_process.wait().expect("Error running rustc");
+
+                    match exit_status.code() {
+                        Some(0) => {
+                            println!(
+                                "{} {}: Ran rustc command (modified for Phoenix) successfully.",
+                                task.c.name, task.c.pkg_version
+                            );
+
+                            // Copy the compilation result to the parent directory of deps, just like what cargo
+                            // would do.
+                            if task.c.is_primary {
+                                copy_result(&task.c).unwrap();
+                            }
+
+                            task.c.available.make_available();
+                        }
+                        Some(code) => panic!("rustc command exited with failure code {}", code),
+                        _ => panic!("rustc command failed and was killed."),
+                    }
+                });
+            }
+        }
+
+        drop(sender);
+        while let Ok(print_task) = receiver.recv() {
+            shell_print(print_task).unwrap_or_else(|e| panic!("shell_print failed: {e}"))
+        }
+    });
 
     Ok(())
 }
@@ -1301,45 +1343,41 @@ fn run_rustc_command(
 
     // If any args actually changed, we need to run the re-created command.
     compile_db.mark_recreated(&c, args_or_deps_changed);
+    // Add our directory of common_deps crates as a library search path, for dependency resolution.
+    // This is okay because we removed all of the potentially conflicting crates from the local target/ directory,
+    // which ensures that adding in the directory of common_deps crate .rmeta/.rlib files won't cause rustc to complain
+    // about multiple "potentially newer" versions of a given crate.
+    // COMMENT(cjr): we didn't really remove all the redundant crates in the newer version.
+    recreated_cmd.arg("-L").arg(common_deps_dir);
+    // We also need to add the directory of other common dependencies, e.g., proc macro crates and such.
+    // recreated_cmd.arg("-L").arg(TBD);
+
+    println!("rustc_env_vars: {}", rustc_env_vars);
+    for env in shlex::split(&rustc_env_vars).unwrap() {
+        let (k, v) = env
+            .split_once('=')
+            .unwrap_or_else(|| panic!("env: {}", env));
+        recreated_cmd.env(k, v);
+    }
+
+    // Suppress warnings for dependency crates
+    if !c.is_primary {
+        recreated_cmd.arg("-Awarnings");
+    }
+    // println!("\n\n--------------- Inherited Environment Variables ----------------\n");
+    // let _env_cmd = Command::new("env").spawn().unwrap().wait().unwrap();
+
     if args_or_deps_changed {
-        // Add our directory of common_deps crates as a library search path, for dependency resolution.
-        // This is okay because we removed all of the potentially conflicting crates from the local target/ directory,
-        // which ensures that adding in the directory of common_deps crate .rmeta/.rlib files won't cause rustc to complain
-        // about multiple "potentially newer" versions of a given crate.
-        recreated_cmd.arg("-L").arg(common_deps_dir);
-        // We also need to add the directory of common dependencies, e.g., proc macro crates and such.
-        // recreated_cmd.arg("-L").arg(TBD);
-
-        println!("rustc_env_vars: {}", rustc_env_vars);
-        for env in shlex::split(&rustc_env_vars).unwrap() {
-            let (k, v) = env
-                .split_once('=')
-                .unwrap_or_else(|| panic!("env: {}", env));
-            recreated_cmd.env(k, v);
-        }
-
-        // Suppress warnings for dependency crates
-        if !c.is_primary {
-            recreated_cmd.arg("-Awarnings");
-        }
-        // println!("\n\n--------------- Inherited Environment Variables ----------------\n");
-        // let _env_cmd = Command::new("env").spawn().unwrap().wait().unwrap();
         println!(
             "About to execute recreated_cmd that had changed arguments or updated dependencies:\n{:?}",
             recreated_cmd
         );
     } else {
-        // set_file_mtime(, FileTime::now()).unwrap();
         println!(
-            "### Args did not change, skipping recreated_cmd:\n{:?}",
-            recreated_cmd
+            "### Args did not change, running the original_cmd:\n{:?}",
+            recreated_cmd /* args did not change */
         );
-        c.available.make_available();
-        return Ok(None);
     }
-
-    // Ensure we have the RUST_TARGET_PATH env var so that rustc can find our target spec JSON file.
-    // recreated_cmd.env("RUST_TARGET_PATH", target_dir_path);
 
     Ok(Some(RustcTask {
         recreated_cmd,

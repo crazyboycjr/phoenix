@@ -2310,15 +2310,18 @@ version = "0.1.0"
 dependencies = [
  "ansi_term",
  "anyhow",
+ "atty",
  "clap 4.5.7",
  "dircpy",
  "getopts",
+ "libc",
  "rayon",
  "regex",
  "semver 1.0.23",
  "serde",
  "serde_json",
  "shlex",
+ "termcolor",
  "toml",
  "walkdir",
 ]
