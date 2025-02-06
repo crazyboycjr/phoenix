@@ -1,16 +1,17 @@
 #!/usr/bin/env bash
+#[rustfmt::skip]
 #![allow(unused_attributes)] /*
 set -euo pipefail
 SRC="$0"
 OUT=/tmp/rustc_wrapper
 [[ ! -e "$OUT" || "$SRC" -nt "$OUT" ]] && rustc "${SRC}" -o ${OUT}
 ${OUT} "$@"
-exit $? #*/
+exit $? # */
 
+use std::collections::HashMap;
 use std::env;
 use std::fs;
 use std::process::{exit, Command};
-use std::collections::HashMap;
 
 /// Reads the parent process ID (PPID) of a given PID by parsing `/proc/{pid}/stat`
 fn get_parent_pid(pid: u32) -> Option<u32> {
@@ -58,7 +59,7 @@ fn get_environ_map(pid: &str) -> HashMap<String, String> {
     let path = format!("/proc/{}/environ", pid);
     if let Ok(content) = fs::read_to_string(path) {
         return content
-            .split('\0')  // `/proc/self/environ` is seperated with `\0`
+            .split('\0') // `/proc/self/environ` is seperated with `\0`
             .filter(|s| !s.is_empty())
             .map(|entry| {
                 let mut parts = entry.splitn(2, '=');
@@ -116,12 +117,33 @@ fn main() {
         let ppid = std::os::unix::process::parent_id();
         let self_env = get_environ_map("self");
         let parent_env = get_environ_map(&ppid.to_string());
+        let parent_process_name = get_process_name(ppid);
+        let pppid = get_parent_pid(ppid).unwrap();
+        let parent_parent_env = get_environ_map(&pppid.to_string());
+        let parent_parent_process_name = get_process_name(pppid);
 
         // Only keep added envs
-        let explicit_envs: Vec<String> = self_env.iter()
-            .filter(|(key, value)| parent_env.get(*key) != Some(value))
+        let self_envs: Vec<String> = self_env
+            .iter()
+            .map(|(k, v)| format!("{}='{}'", k, v))
+            .collect();
+        let parent_parent_envs: Vec<String> = parent_parent_env
+            .iter()
+            .map(|(k, v)| format!("{}='{}'", k, v))
+            .collect();
+        let explicit_envs: Vec<String> = self_env
+            .iter()
+            .filter(|(key, value)| parent_parent_env.get(*key) != Some(value))
             .map(|(key, value)| format!("{}='{}'", key, value))
             .collect();
-        println!("{} {}", explicit_envs.join(" "), args.join(" "));
+        // println!("{} {}", explicit_envs.join(" "), args.join(" "));
+        use std::io::Write;
+        let mut f = std::fs::File::options()
+            .create(true)
+            .append(true)
+            .open("/tmp/rustc_wrapper.log")
+            .unwrap();
+        // writeln!(f, "parent_parent_process_name: {}", parent_parent_process_name.unwrap());
+        writeln!(f, "{} {}", explicit_envs.join(" "), args.join(" "));
     }
 }
