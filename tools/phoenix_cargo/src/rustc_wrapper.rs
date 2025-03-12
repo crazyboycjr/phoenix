@@ -42,8 +42,9 @@ fn is_parent_build_script() -> bool {
         }
 
         if let Some(name) = get_process_name(ppid) {
-            // println!("parent_process_name: {}", name);
-            if name == "build-script-build" || name.starts_with("build_script_build-") {
+            // eprintln!("parent_process_name: {}", name);
+            if name == "build-script-build"[..15] || name.starts_with(&"build_script_build-"[..15]) {
+            // if name == "build-script-build" || name.starts_with(&"build_script_build-") {
                 return true;
             }
         }
@@ -112,7 +113,7 @@ fn main() -> Result<()> {
     }
 
     // 🔥 Always execute `rustc` if `-vV` is present
-    if args.iter().any(|arg| arg == "-vV") {
+    if args.iter().any(|arg| arg == "-vV" || arg == "--version") {
         exec_rustc(&args);
     }
     if args.iter().any(|arg| arg.contains("--print=")) {
@@ -121,10 +122,10 @@ fn main() -> Result<()> {
     if args.iter().any(|arg| arg.contains("--check-cfg=")) {
         exec_rustc(&args);
     }
-    if is_parent_build_script() {
-        // rustc is executed within `build-script-build`, so faithfully execute rustc
-        exec_rustc(&args);
-    }
+    // if is_parent_build_script() {
+    //     // rustc is executed within `build-script-build`, so faithfully execute rustc
+    //     exec_rustc(&args);
+    // }
     // crate 'build_script_build' can't be simply bypassed. The dependency of this crate are dev-dependencies.
     // We couldn't execute rustc as is. This is because a dev-dependency could be a normal
     // dependency at the same time, and we wouldn't know it in rustc_wrapper.
@@ -184,9 +185,9 @@ fn main() -> Result<()> {
     }
 
     let common_deps = CommonDeps::new(&common_deps_dir)?;
-    let compile_db = CompilationDatabase::new(common_deps_dir, out_dir, common_deps);
+    let mut compile_db = CompilationDatabase::new(common_deps_dir, out_dir, common_deps);
 
-    let rustc_task = generate_rustc_task(&reconstructed_cmd, &compile_db)?;
+    let rustc_task = generate_rustc_task(&reconstructed_cmd, &mut compile_db)?;
 
     if let Some(task) = rustc_task {
         println!("task.recreated_cmd: {:?}", task.recreated_cmd);
@@ -214,14 +215,61 @@ fn copy_to_deps(c: &Crate, destdir: &Path) -> Result<()> {
     Ok(())
 }
 
+fn copy_result(c: &Crate) -> Result<()> {
+    // copy the library
+    let destdir = c.path.parent().unwrap().parent().unwrap();
+    let destdir = destdir.parent().unwrap().join("artifact");
+    let _ = fs::create_dir_all(&destdir);
+    let (result_name, is_binary) = if let Some(ext) = c.path.extension() {
+        // lib
+        (format!("lib{}.{}", c.name, ext.to_string_lossy()), false)
+    } else {
+        // binary
+        (c.name.clone(), true)
+    };
+
+    let to = destdir.join(result_name);
+    println!("Copy {} to {}", c.path.display(), to.display());
+    fs::copy(&c.path, to)?;
+
+    // copy the dep file
+    let from = c
+        .path
+        .with_file_name(format!("{}-{}.d", c.name, c.metadata));
+    let to = if !is_binary {
+        destdir.join(format!("lib{}.d", c.name))
+    } else {
+        destdir.join(format!("{}.d", c.name))
+    };
+    println!("Copy {} to {}", from.display(), to.display());
+    fs::copy(from, to)?;
+
+    Ok(())
+}
+
 struct RustcTask {
     recreated_cmd: Command,
-    #[allow(unused)]
     c: Crate,
 }
 
 fn exec_rustc_task(mut task: RustcTask) -> Result<()> {
-    Err(task.recreated_cmd.exec().into())
+    // Err(task.recreated_cmd.exec().into())
+    let mut rustc_process = task.recreated_cmd.spawn().expect("Failed to execute rustc");
+    let exit_status = rustc_process.wait().expect("Error running rustc");
+
+    if let Some(0) = exit_status.code() {
+        println!(
+            "{} {}: Ran rustc command (modified for Phoenix) successfully.",
+            task.c.name, task.c.pkg_version
+        );
+
+        // Copy the compilation result to the parent directory of deps, just like what cargo
+        // would do.
+        if task.c.is_primary {
+            copy_result(&task.c).unwrap();
+        }
+    }
+    exit(exit_status.into_raw());
 }
 
 fn put_crate(c: &Crate) -> Result<()> {
@@ -583,8 +631,11 @@ struct CompilationDatabase {
     /// The directory that contains the common_deps crates for `phoenix_common`.
     common_deps_dir: PathBuf,
 
-    /// The directory specified by -L dependency=path, target/[profile]/deps
-    deps_dir: PathBuf,
+    /// The path specified by --out-dir, usually target/[profile]/deps
+    out_dir: PathBuf,
+
+    /// A list of search paths specified -L
+    search_paths: Vec<PathBuf>,
 
     /// The dependency closure for `phoenix_common`. Crates in this set are common_deps and will be
     /// used to inject into as dependencies of plugins (if they can replace any compatible
@@ -593,12 +644,17 @@ struct CompilationDatabase {
 }
 
 impl CompilationDatabase {
-    fn new(common_deps_dir: PathBuf, deps_dir: PathBuf, common_deps: CommonDeps) -> Self {
+    fn new(common_deps_dir: PathBuf, out_dir: PathBuf, common_deps: CommonDeps) -> Self {
         Self {
             common_deps_dir,
-            deps_dir,
+            out_dir,
+            search_paths: Vec::new(),
             common_deps,
         }
+    }
+
+    fn add_search_path<P: AsRef<Path>>(&mut self, search_path: P) {
+        self.search_paths.push(search_path.as_ref().to_path_buf());
     }
 
     fn put_crate(&self, c: &Crate) -> Result<()> {
@@ -661,7 +717,7 @@ impl CompilationDatabase {
             // Instead, it just checks whether a compatible one can be found in the common_deps_set
             // for all direct dependencies.
             desired.dependencies.iter().all(|dep| {
-                self.get_crate_from_common_deps(&dep)
+                self.get_crate_from_search_paths(&dep, &self.search_paths)
                     .map(|dep_crate| {
                         self.contains_compatible_crates_in_common_deps(
                             &dep_crate,
@@ -701,6 +757,9 @@ impl CompilationDatabase {
                         cands.push(cand.clone());
                     }
                 }
+                if cands.is_empty() {
+                    println!("desired crate: {:?}", c);
+                }
                 cands
             })
             .unwrap_or_default()
@@ -724,7 +783,7 @@ impl CompilationDatabase {
 /// * Returns an error if the command fails to parse.
 fn generate_rustc_task(
     original_cmd: &str,
-    compile_db: &CompilationDatabase,
+    compile_db: &mut CompilationDatabase,
 ) -> Result<Option<RustcTask>> {
     let common_deps_dir = compile_db.common_deps_dir.clone();
 
@@ -738,19 +797,6 @@ fn generate_rustc_task(
 
     let crate_name_with_hash = c.crate_name_with_hash();
 
-    // Skip crates that are included in common_deps
-    if c.name != BUILD_SCRIPT_CRATE_NAME
-        && !compile_db
-            .find_compatible_crates_in_common_deps(&c)
-            .is_empty()
-    {
-        println!(
-            "\n### Skipping already-built crate {:?}",
-            crate_name_with_hash
-        );
-        return Ok(None);
-    }
-
     println!("\n\nLooking at original command:\n{}", original_cmd);
     let Some((rustc_env_vars, _command_without_env, top_level_matches)) =
         parse_rustc_command(original_cmd)?
@@ -758,6 +804,7 @@ fn generate_rustc_task(
         // skip invocations of build scripts
         unreachable!("invocation of build scripts, this shouldn't be reachable");
     };
+    println!("common_deps_dir: {}", common_deps_dir.display());
 
     let (crate_source_file, additional_args) = top_level_matches
         .subcommand()
@@ -798,6 +845,29 @@ fn generate_rustc_task(
         })
         .collect::<Vec<_>>();
     println!("command has rust search paths: {:?}", search_paths);
+    for p in &search_paths {
+        compile_db.add_search_path(p);
+    }
+
+    // Skip crates that are included in common_deps
+    if c.name != BUILD_SCRIPT_CRATE_NAME
+        && !compile_db
+            .find_compatible_crates_in_common_deps(&c)
+            .is_empty()
+    {
+        println!(
+            "\n### Skipping already-built crate {:?}",
+            crate_name_with_hash
+        );
+        return Ok(None);
+    }
+
+    if c.name == "phoenix_common" {
+        panic!(
+            "phoenix_common will be rebuilt, this is usually not an expected behavior. \
+            Please check the compile log and tune dependencies if necessary."
+        );
+    }
 
     // After adding the initial stuff: rustc command, crate name, (optional --edition), and crate source file,
     // the other arguments are added in the loop below.
@@ -898,13 +968,6 @@ fn generate_rustc_task(
             recreated_cmd.arg(arg.as_str());
             recreated_cmd.arg(new_value.as_ref());
         }
-    }
-
-    if c.name == "phoenix_common" {
-        panic!(
-            "phoenix_common will be rebuilt, this is usually not an expected behavior. \
-            Please check the compile log and tune dependencies if necessary."
-        );
     }
 
     // Add our directory of common_deps crates as a library search path, for dependency resolution.

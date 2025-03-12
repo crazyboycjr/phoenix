@@ -110,6 +110,7 @@ pkgs=`test -z "$@" && echo ${default_plugins} || printf -- '-p phoenix-%s ' "$@"
 RUSTC_WRAPPER=${PHOENIX_RUSTC_WRAPPER} \
 cargo build --release --target-dir ${PHOENIX_TARGET_DIR} ${pkgs}
 '''
+dependencies = ["phoenix_common"]
 
 [tasks.deploy-plugins]
 description = "Deploy all plugins."

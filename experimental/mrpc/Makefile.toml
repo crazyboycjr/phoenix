@@ -2,6 +2,13 @@ extend = "../../Makefile.toml"
 
 [env]
 PROJECT_ROOT = { script = ["realpath $(pwd)/../../"] }
+TARGET_DIR = "${PROJECT_ROOT}/target"
+PHOENIX_TARGET_DIR = "${PROJECT_ROOT}/target/phoenix"
+COMMON_DEPS_DIR = "${PHOENIX_TARGET_DIR}/common_deps"
+PHOENIX_COMMON_DEPS_DIR = "${COMMON_DEPS_DIR}"
+PHOENIX_RUSTC_WRAPPER = "${TARGET_DIR}/release/rustc_wrapper"
+# This is a hack to force enabling std feature for indexmap
+CARGO_FEATURE_STD="1"
 
 # the default target
 [tasks.dev-test-flow]
@@ -25,23 +32,21 @@ Build specified plugins by package name.
 If no argument is provided, build all plugins in this workspace.
 '''
 # cargo make build-plugins [package-name]*
-command = "${TARGET_DIR}/release/phoenix_cargo"
-args = [
-    "--compile-log",
-    "${PHOENIX_COMPILE_LOG}",
-    "--host-dep",
-    "${HOST_DEP}",
-    "--",
-    "build",
-    "--release",
-    "--target-dir",
-    "${PHOENIX_TARGET_DIR}",
-    "--manifest-path",
-    "${PROJECT_ROOT}/experimental/mrpc/Cargo.toml",
-    "-p",
-    "phoenix-*",
-]
-# dependencies = ["remove-fingerprint4"]
+cwd = "${PROJECT_ROOT}/experimental/mrpc"
+script = '''
+default_plugins=`cargo metadata --format-version 1 | jq -r '
+  .packages[].manifest_path
+  | select(test("experimental/mrpc/plugin"))
+  | sub("/Cargo.toml$"; "")  # Remove the /Cargo.toml part
+  | split("/") | last        # Get only the last directory name
+  | "-p phoenix-" + .
+'`
+pkgs=`test -z "$@" && echo ${default_plugins} || printf -- '-p phoenix-%s ' "$@"`
+echo $pkgs
+RUSTC_WRAPPER=${PHOENIX_RUSTC_WRAPPER} \
+cargo build --release --target-dir ${PHOENIX_TARGET_DIR} ${pkgs}
+'''
+dependencies = ["phoenix_common"]
 
 [tasks.deploy-mrpc-plugins]
 script = "${PROJECT_ROOT}/scripts/deploy_plugins.sh ${PHOENIX_PREFIX} ${PHOENIX_TARGET_DIR}"
@@ -53,6 +58,3 @@ Build mRPC example apps under the `examples/` directory.
 script = '''
 cargo build --release -p 'rpc_*' -p 'masstree_analytics' -p 'hotel_reservation'
 '''
-
-[tasks]
-remove-fingerprint4.alias = "remove-fingerprint"

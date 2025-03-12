@@ -13,6 +13,6 @@ if [[ $# -ge 2 ]]; then
     TARGETDIR=$2
 fi
 
-for plugin in `find "${TARGETDIR}"/release/ -maxdepth 1 -type f -name "libphoenix_*.rlib" -o -name "libphoenix_*.d"`; do
+for plugin in `find "${TARGETDIR}"/artifact/ -maxdepth 1 -type f -name "libphoenix_*.rlib" -o -name "libphoenix_*.d"`; do
     install -v -Dm755 "${plugin}" -t "${PHOENIX_PREFIX}"/plugins/
 done
