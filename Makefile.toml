@@ -5,8 +5,11 @@ PHOENIX_PREFIX = { value = "/tmp/phoenix", condition.env_not_set = [
 PROJECT_ROOT = { script = ["pwd"] }
 TARGET_DIR = "${PROJECT_ROOT}/target"
 PHOENIX_TARGET_DIR = "${PROJECT_ROOT}/target/phoenix"
-PHOENIX_COMPILE_COMMANDS = "${PHOENIX_TARGET_DIR}/phoenix_compile_commands.json"
 COMMON_DEPS_DIR = "${PHOENIX_TARGET_DIR}/common_deps"
+PHOENIX_COMMON_DEPS_DIR = "${COMMON_DEPS_DIR}"
+PHOENIX_RUSTC_WRAPPER = "${TARGET_DIR}/release/rustc_wrapper"
+# This is a hack to force enabling std feature for indexmap
+CARGO_FEATURE_STD="1"
 
 [tasks.default]
 alias = "dev-test-flow"
@@ -29,7 +32,7 @@ dependencies = [
 [tasks.phoenix_cargo]
 description = "Build phoenix_cargo tool."
 cwd = "${PROJECT_ROOT}"
-script = "cargo build --release --bin phoenix_cargo"
+script = "cargo build --release --bin phoenix_cargo --bin rustc_wrapper"
 
 [tasks.phoenix_common]
 description = '''
@@ -41,10 +44,14 @@ script = '''
 set -euo pipefail
 mkdir -p ${PHOENIX_TARGET_DIR}
 mkdir -p ${COMMON_DEPS_DIR}
-${TARGET_DIR}/release/phoenix_cargo \
-  --build-common-deps \
-  --compile-commands ${PHOENIX_COMPILE_COMMANDS} --common-deps ${COMMON_DEPS_DIR} -- \
-  build --release --target-dir ${PHOENIX_TARGET_DIR} -p phoenix_common
+# ${TARGET_DIR}/release/phoenix_cargo \
+#   --build-common-deps \
+#   --common-deps ${COMMON_DEPS_DIR} -- \
+#   build --release --target-dir ${PHOENIX_TARGET_DIR} -p phoenix_common
+
+RUSTC_WRAPPER=${PHOENIX_RUSTC_WRAPPER} \
+PHOENIX_IS_COMMON_DEP=1 \
+cargo build --release --target-dir ${PHOENIX_TARGET_DIR} -p phoenix_common
 '''
 dependencies = ["phoenix_cargo"]
 
@@ -53,9 +60,12 @@ description = "Build phoenixos."
 cwd = "${PROJECT_ROOT}"
 script = '''
 mkdir -p ${PHOENIX_TARGET_DIR}
-${TARGET_DIR}/release/phoenix_cargo \
-  --compile-commands ${PHOENIX_COMPILE_COMMANDS} --common-deps ${COMMON_DEPS_DIR} -- \
-  build --release --target-dir ${PHOENIX_TARGET_DIR} -p phoenixos
+# ${TARGET_DIR}/release/phoenix_cargo \
+#   --common-deps ${COMMON_DEPS_DIR} -- \
+#   build --release --target-dir ${PHOENIX_TARGET_DIR} -p phoenixos
+
+RUSTC_WRAPPER=${PHOENIX_RUSTC_WRAPPER} \
+cargo build --release --target-dir ${PHOENIX_TARGET_DIR} -p phoenixos
 '''
 dependencies = ["phoenix_common"]
 
@@ -92,10 +102,13 @@ default_plugins=`cargo metadata --format-version 1 | jq -r '
   | "-p phoenix-" + .
 '`
 pkgs=`test -z "$@" && echo ${default_plugins} || printf -- '-p phoenix-%s ' "$@"`
-${TARGET_DIR}/release/phoenix_cargo \
-  --compile-commands ${PHOENIX_COMPILE_COMMANDS} --common-deps ${COMMON_DEPS_DIR} -- \
-  build --release --target-dir ${PHOENIX_TARGET_DIR} \
-  ${pkgs}
+# ${TARGET_DIR}/release/phoenix_cargo \
+#   --common-deps ${COMMON_DEPS_DIR} -- \
+#   build --release --target-dir ${PHOENIX_TARGET_DIR} \
+#   ${pkgs}
+
+RUSTC_WRAPPER=${PHOENIX_RUSTC_WRAPPER} \
+cargo build --release --target-dir ${PHOENIX_TARGET_DIR} ${pkgs}
 '''
 
 [tasks.deploy-plugins]

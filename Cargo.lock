@@ -2322,6 +2322,7 @@ dependencies = [
  "serde_json",
  "shlex",
  "termcolor",
+ "thiserror",
  "toml",
  "walkdir",
 ]
